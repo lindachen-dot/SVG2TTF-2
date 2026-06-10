@@ -943,7 +943,7 @@
 
     function updateDownloadState() {
       const ready = state.glyphs.length > 0 &&
-        state.mappings.length === state.glyphs.length &&
+
         els.fileName.value.trim().length > 0;
       els.downloadBtn.disabled = !ready;
     }
@@ -956,8 +956,10 @@
       }
       if (state.mappings.length !== state.glyphs.length) {
         const diff = state.mappings.length - state.glyphs.length;
-        alert(diff > 0 ? `Unicode 數量比字符多出 ${diff} 個。` : `Unicode 數量比字符缺少 ${Math.abs(diff)} 個。`);
-        return;
+        const msg = diff > 0
+          ? `Unicode 數量比字符多出 ${diff} 個，多餘的碼位將被略過。`
+          : `Unicode 數量比字符缺少 ${Math.abs(diff)} 個，缺少對應的字符將被略過。`;
+        if (!confirm(msg + '\n\n確定要繼續下載嗎？')) return;
       }
       try {
         const baseName = rawName.replace(/\.ttf$/i, '').trim() || 'SVG2TTF';
@@ -1255,26 +1257,53 @@
     }
 
     function buildTtf(glyphs, mappings, unitsPerEm, familyName) {
-      const targetHeight = unitsPerEm === 2048 ? 1800 : 880;
       const bearing = unitsPerEm === 2048 ? 100 : 50; // LSB = RSB
-      const maxBoxHeight = glyphs.reduce((max, glyph) => {
-        const box = glyph.box || contoursBBox(glyph.contours);
-        return Math.max(max, box ? box.height : 0);
-      }, 1);
-      const scale = targetHeight / maxBoxHeight;
+      // BBox 安全邊界（硬限）
+      const BBOX_TOP    = unitsPerEm === 2048 ? 2140 : 1045;
+      const BBOX_BOTTOM = unitsPerEm === 2048 ?  550 :  268;
+      // 目標：大寫字母頂端對齊 cap-height（Ascender × 97%）
+      const TARGET_CAP  = unitsPerEm === 2048 ? 1455 :  710;
 
+      // 基線 Y（SVG 座標）
+      // 有 <line>：取距字符底部最近的那條
+      // 無基線：估算為字符底部往上 15%（保留下伸空間，避免 g/p/q/y 超出 Descender）
+      function getBaselineY(glyph) {
+        const glyphBottom = glyph.box.y + glyph.box.height;
+        if (state.baselines.length) {
+          return state.baselines.reduce((closest, bl) =>
+            Math.abs(bl - glyphBottom) < Math.abs(closest - glyphBottom) ? bl : closest
+          , state.baselines[0]);
+        }
+        return glyph.box.y + glyph.box.height * 0.85;
+      }
+
+      // 各字符 above/below（SVG px）
+      const metrics = glyphs.map(g => {
+        const bl = getBaselineY(g);
+        const above = bl - g.box.y;
+        const below = (g.box.y + g.box.height) - bl;
+        return { above: Math.max(above, 0.001), below: Math.max(below, 0.001) };
+      });
+
+      // 每個字符允許的最大縮放（不超 BBox 硬限）
+      const scaleLimits = metrics.map(m => Math.min(
+        BBOX_TOP    / m.above,
+        BBOX_BOTTOM / m.below
+      ));
+
+      // 全局縮放：75 百分位字高對齊 cap-height，排除符號類極高字符拉動基準
+      const aboves = metrics.map(m => m.above).sort((a, b) => a - b);
+      const p75Above = aboves[Math.floor(aboves.length * 0.75)] || 1;
+      const scaleTarget = TARGET_CAP / p75Above;
+      const scale = Math.min(scaleTarget, ...scaleLimits);
+
+      const count = Math.min(glyphs.length, mappings.length);
       const fontGlyphs = [{ name: '.notdef', contours: [], advanceWidth: 1000, codePoint: 0 }];
-      for (let i = 0; i < glyphs.length; i++) {
+      for (let i = 0; i < count; i++) {
         const glyph = glyphs[i];
         const scaledWidth = Math.round(glyph.box.width * scale);
         const advanceWidth = scaledWidth + bearing * 2;
-        // 找距字符底部絕對距離最近的 <line>，無則用字符底部
-        const glyphBottom = glyph.box.y + glyph.box.height;
-        const baselineY = state.baselines.length
-          ? state.baselines.reduce((closest, bl) =>
-              Math.abs(bl - glyphBottom) < Math.abs(closest - glyphBottom) ? bl : closest
-            , state.baselines[0])
-          : glyphBottom;
+        const baselineY = getBaselineY(glyph);
         const contours = glyph.contours.map(contour => contour.map(p => ({
           x: Math.round((p.x - glyph.box.x) * scale) + bearing,
           y: Math.round((baselineY - p.y) * scale),
@@ -1287,7 +1316,36 @@
           codePoint: mappings[i].codePoint
         });
       }
-      return new TtfBuilder(fontGlyphs, mappings, unitsPerEm, familyName).build();
+      // 從實際縮放後的字符反推 capsHeight / xHeight
+      // 優先清單：各語言平頂無伸部的基準字（codePoint）
+      const CAP_CPS = [
+        0x0048, 0x0049, 0x0045, 0x0046, 0x0054, // 拉丁  H I E F T
+        0x0397, 0x0399, 0x0395,                  // 希臘  Η Ι Ε
+        0x041D, 0x0418, 0x0415,                  // 西里爾 Н И Е
+      ];
+      const X_CPS = [
+        0x0078, 0x006F, 0x006E, 0x007A,          // 拉丁  x o n z
+        0x03BF, 0x03BD, 0x03B5,                  // 希臘  ο ν ε
+        0x043E, 0x043D, 0x0435,                  // 西里爾 о н е
+      ];
+      function glyphYMax(fg) {
+        const pts = fg.contours.flat();
+        return pts.length ? Math.max(...pts.map(p => p.y)) : null;
+      }
+      function findHeight(cpList) {
+        for (const cp of cpList) {
+          const fg = fontGlyphs.find(g => g.codePoint === cp);
+          if (fg && fg.contours.length) {
+            const h = glyphYMax(fg);
+            if (h !== null && h > 0) return h;
+          }
+        }
+        return null;
+      }
+      const capsHeight = findHeight(CAP_CPS) ?? (unitsPerEm === 2048 ? 1495 : 730);
+      const xHeight    = findHeight(X_CPS)   ?? (unitsPerEm === 2048 ? 1059 : 517);
+
+      return new TtfBuilder(fontGlyphs, mappings, unitsPerEm, familyName, capsHeight, xHeight).build();
     }
 
     class Writer {
@@ -1306,11 +1364,13 @@
     }
 
     class TtfBuilder {
-      constructor(glyphs, mappings, unitsPerEm, familyName) {
+      constructor(glyphs, mappings, unitsPerEm, familyName, capsHeight, xHeight) {
         this.glyphs = glyphs;
         this.mappings = mappings;
         this.unitsPerEm = unitsPerEm;
         this.familyName = familyName || 'SVG2TTF';
+        this.capsHeight = capsHeight;
+        this.xHeight    = xHeight;
         this.fontBox = this.computeFontBox();
       }
 
@@ -1546,12 +1606,25 @@
 
       buildOS2() {
         const is2048 = this.unitsPerEm === 2048;
-        const typoAsc  = is2048 ? 1556 : 760;
-        const typoDesc = is2048 ? -438 : -214;
-        const capsH    = is2048 ? 1495 : 730;
-        const xH       = is2048 ? 1059 : 517;
-        const winAsc   = is2048 ? 2189 : 1069;
-        const winDesc  = is2048 ? 600  : 293;
+        const is2048r  = is2048;
+        const r        = is2048 ? 2.048 : 1;
+        const typoAsc  = is2048 ? 1500  : 732;
+        const typoDesc = is2048 ? -500  : -244;
+        const capsH    = this.capsHeight;
+        const xH       = this.xHeight;
+        const winAsc   = is2048 ? 2189  : 1069;
+        const winDesc  = is2048 ? 600   : 293;
+        // Font dimensions（截圖 EM1000 基準，EM2048 自動 ×2.048）
+        const subXSz  = Math.round(650 * r);
+        const subYSz  = Math.round(600 * r);
+        const subXOff = Math.round(  0 * r);
+        const subYOff = Math.round( 75 * r);
+        const supXSz  = Math.round(650 * r);
+        const supYSz  = Math.round(600 * r);
+        const supXOff = Math.round(  0 * r);
+        const supYOff = Math.round(350 * r);
+        const strSz   = Math.round( 50 * r);
+        const strPos  = Math.round(300 * r);
         const cps = this.mappings.map(m => m.codePoint);
         const first = Math.min(...cps);
         const last  = Math.max(...cps);
@@ -1561,9 +1634,9 @@
         w.u16(400);         // offset  4: usWeightClass
         w.u16(5);           // offset  6: usWidthClass
         w.u16(0);           // offset  8: fsType
-        w.i16(0); w.i16(0); w.i16(0); w.i16(0); // offset 10-16: ySubscript
-        w.i16(0); w.i16(0); w.i16(0); w.i16(0); // offset 18-24: ySuperscript
-        w.i16(0); w.i16(0); // offset 26-28: yStrikeout
+        w.i16(subXSz); w.i16(subYSz); w.i16(subXOff); w.i16(subYOff); // offset 10-16: ySubscript
+        w.i16(supXSz); w.i16(supYSz); w.i16(supXOff); w.i16(supYOff); // offset 18-24: ySuperscript
+        w.i16(strSz);  w.i16(strPos); // offset 26-28: yStrikeout
         w.i16(0);           // offset 30: sFamilyClass
         for (let i = 0; i < 10; i++) w.u8(0); // offset 32-41: panose
         // ulUnicodeRange：依實際字符自動偵測（OpenType spec bit ranges）
